@@ -19,7 +19,7 @@ other than the usual ones, invalid UTF-8, and duplicate keys.
 
 ```elixir
 # mix.exs
-{:mongodb_rust_decoder, github: "..."}
+{:mongodb_rust_decoder, github: "commoncurriculum/elixir-bson"}
 
 # config/config.exs
 config :mongodb_driver, decoder: MongoRustDecoder
