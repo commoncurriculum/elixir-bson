@@ -22,8 +22,9 @@ defmodule MongoRustDecoder.MixProject do
   defp deps do
     [
       {:rustler, "~> 0.39", runtime: false},
-      # Needs BSON.LazyDocuments / lazy_cursor_document/1, from the lazy cursor batch change.
-      {:mongodb_driver, github: "commoncurriculum/elixir-mongodb-driver", branch: "claude/project-thread-cdrmxc"},
+      # Works with any release that has the :decoder setting. Batches are only decoded lazily,
+      # in chunks, with a driver that has BSON.LazyDocuments.
+      {:mongodb_driver, "~> 1.4"},
       {:stream_data, "~> 1.1", only: :test}
     ]
   end

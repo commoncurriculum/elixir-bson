@@ -11,8 +11,12 @@ other than the usual ones, invalid UTF-8, and duplicate keys.
 
 ## Requirements
 
-- The lazy cursor batch change to `mongodb_driver` (`BSON.LazyDocuments`). For now it lives on
-  branch `claude/project-thread-cdrmxc` of `commoncurriculum/elixir-mongodb-driver`.
+- `mongodb_driver` 1.4 or later. Any release works, since they all read the `:decoder`
+  setting. With the lazy cursor batch change (`BSON.LazyDocuments`, for now on branch
+  `claude/project-thread-cdrmxc` of `commoncurriculum/elixir-mongodb-driver`), getMore
+  batches are also decoded in chunks while the next batch is fetched. That is the fastest
+  setup; see the benchmark below. To use the branch, add
+  `{:mongodb_driver, github: "commoncurriculum/elixir-mongodb-driver", branch: "claude/project-thread-cdrmxc", override: true}`.
 - A Rust toolchain at compile time.
 
 ## Usage
@@ -54,7 +58,13 @@ The first batch of a cursor is decoded in one go, so that `%Mongo.Stream{docs: d
 list; later batches are decoded 100 documents at a time while the next one is fetched. A very
 large `batch_size` therefore makes the first batch the slow part.
 
-Fetching the same batches without decoding takes about 0.3 s.
+Fetching the same batches without decoding takes about 0.3 s. With a stock `mongodb_driver`
+(1.6.4) and MongoRustDecoder, the same read takes 0.6 to 1.0 s at every batch size.
+
+Decoding alone, 300k of these documents on one core: the NIF takes about 0.22 s, against
+0.10 s for the `bson` crate just walking and validating the raw bytes in pure Rust, and
+0.40 s for the crate building its own `bson::Document`. What remains is building
+Erlang terms on the BEAM heap.
 
 ```sh
 MIX_ENV=bench mix run bench/find.exs

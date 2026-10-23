@@ -18,6 +18,9 @@ defmodule MongoRustDecoder do
 
   alias MongoRustDecoder.Native
 
+  # Only drivers with lazy cursor batches define these, and only those call the hooks below.
+  @compile {:no_warn_undefined, [{BSON.Decoder, :lazy_cursor_document, 1}, {BSON.Decoder, :next_lazy_document, 1}]}
+
   # Above this size a document is decoded on a dirty scheduler, so a large reply
   # does not block a normal scheduler for too long.
   @dirty_threshold 64 * 1024
@@ -57,7 +60,8 @@ defmodule MongoRustDecoder do
     cursor =
       Enum.reduce(["firstBatch", "nextBatch"], cursor, fn key, cursor ->
         case cursor do
-          %{^key => %BSON.LazyDocuments{} = lazy} -> %{cursor | key => %{lazy | decoder: __MODULE__}}
+          # A map pattern, not a struct one: drivers without lazy batches have no such struct.
+          %{^key => %{__struct__: BSON.LazyDocuments} = lazy} -> %{cursor | key => %{lazy | decoder: __MODULE__}}
           _other -> cursor
         end
       end)
