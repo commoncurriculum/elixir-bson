@@ -55,10 +55,15 @@ Key order is not preserved. Use `BSON.PreserveOrderDecoder` if you need that.
 
 | Batch size | mongodb_driver 1.6.4 | lazy batches (Elixir) | + MongoRustDecoder |
 |---|---|---|---|
-| default | 5.5 s | 0.95 s | 0.33 to 0.38 s |
-| 1,000 | 1.5 to 2.0 s | 1.1 s | 0.77 to 0.89 s |
-| 10,000 | 4.3 s | 1.0 to 1.15 s | 0.31 to 0.58 s |
-| 100,000 | 5.3 to 5.8 s | 2.7 to 2.9 s | 0.51 to 0.77 s |
+| default | 5.5 s | 0.9 to 1.0 s | 0.31 to 0.34 s |
+| 1,000 | 1.5 to 2.0 s | 0.9 to 1.0 s | 0.62 to 0.84 s |
+| 10,000 | 4.3 s | 0.9 to 1.05 s | 0.39 to 0.43 s |
+| 100,000 | 5.3 to 5.8 s | 1.7 to 1.9 s | 0.42 to 0.50 s |
+
+With a batch size of 1,000, the read takes 300 getMore round trips. MongoDB alone needs about
+0.27 s to serve them, measured with a raw socket and no driver, so small batches cost the most.
+Batches are decoded 100 documents at a time either way, so the default batch size uses no more
+memory.
 
 The first batch of a cursor is decoded in one go, so that `%Mongo.Stream{docs: docs}` stays a
 list; later batches are decoded 100 documents at a time while the next one is fetched. A very
