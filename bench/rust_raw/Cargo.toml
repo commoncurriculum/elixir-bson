@@ -1,0 +1,9 @@
+[package]
+name = "rust_raw"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+bson = "3.1"
+[profile.release]
+lto = true
+codegen-units = 1

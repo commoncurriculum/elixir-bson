@@ -5,7 +5,9 @@
 //! itself (Decimal128, dates outside the range `BSON.Decoder` accepts, unusual NaN
 //! payloads, binary subtypes `BSON.Decoder` rejects, duplicate keys, invalid UTF-8)
 //! make the call return `:fallback`, and the Elixir side then decodes that document
-//! with `BSON.Decoder`, so behaviour stays identical.
+//! with `BSON.Decoder`, so behaviour stays identical. So do documents nested deeper than
+//! `MAX_DEPTH` (the recursion would otherwise overflow a scheduler's stack), DBPointer, and
+//! malformed input, for which `BSON.Decoder` raises its own error.
 
 use bson::raw::{RawArray, RawBsonRef, RawDocument};
 use bson::spec::BinarySubtype;
@@ -13,8 +15,16 @@ use rustler::sys::{enif_make_list_from_array, enif_make_map_from_arrays, ErlNifT
 use rustler::types::binary::{Binary, NewBinary};
 use rustler::{Atom, Encoder, Env, NifResult, Term};
 use smallvec::SmallVec;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::mem::MaybeUninit;
+
+/// Nesting limit. Each level takes about 1.6 KB of native stack, and a dirty scheduler's stack
+/// is 320 KB by default; MongoDB itself stores documents up to 100 levels deep.
+const MAX_DEPTH: u32 = 128;
+
+/// Strings and binaries up to this size are copied, like `BSON.Decoder` does (the BEAM copies
+/// sub-binaries of up to 64 bytes); longer ones are sub-binaries of the reply.
+const COPY_LIMIT: usize = 64;
 
 /// Most documents have few fields, so keep their terms on the stack.
 type Terms = SmallVec<[ErlNifTerm; 16]>;
@@ -84,6 +94,9 @@ struct Ctx<'a> {
     /// Key binaries already made in this call. Documents of a batch share their keys,
     /// so each distinct key is allocated once per call instead of once per document.
     keys: RefCell<KeyCache<'a>>,
+    depth: Cell<u32>,
+    /// The "Etc/UTC" and "UTC" binaries of DateTime structs, made once per call.
+    utc: Cell<Option<(ErlNifTerm, ErlNifTerm)>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -94,7 +107,15 @@ impl<'a> Ctx<'a> {
             source,
             base,
             keys: RefCell::new(SmallVec::new()),
+            depth: Cell::new(0),
+            utc: Cell::new(None),
         }
+    }
+
+    /// The offset of `bytes` in the source binary, if the slice lies within it.
+    fn offset_in_source(&self, bytes: &[u8]) -> Option<usize> {
+        let offset = (bytes.as_ptr() as usize).checked_sub(self.base)?;
+        (offset.checked_add(bytes.len())? <= self.source.len()).then_some(offset)
     }
 
     fn key(&self, key: &[u8]) -> ErlNifTerm {
@@ -105,22 +126,36 @@ impl<'a> Ctx<'a> {
         let term = self.copied_binary(key).as_c_arg();
         if cache.len() < 64 {
             // Keys point into the source binary, which outlives this call's Ctx.
-            let offset = (key.as_ptr() as usize).wrapping_sub(self.base);
-            if offset + key.len() <= self.source.len() {
+            if let Some(offset) = self.offset_in_source(key) {
                 cache.push((&self.source.as_slice()[offset..offset + key.len()], term));
             }
         }
         term
     }
 
-    /// A sub-binary of the source for a slice that points into it, so string values are not copied.
-    fn sub_binary(&self, bytes: &[u8]) -> DResult<Term<'a>> {
-        let offset = (bytes.as_ptr() as usize).wrapping_sub(self.base);
-        if offset + bytes.len() > self.source.len() {
-            return Ok(self.copied_binary(bytes));
+    /// A string or binary value: a sub-binary of the source if it is long, so it is not copied.
+    fn value_binary(&self, bytes: &[u8]) -> Term<'a> {
+        match self.offset_in_source(bytes) {
+            Some(offset) if bytes.len() > COPY_LIMIT => {
+                // SAFETY: offset_in_source checked the bounds.
+                unsafe { self.source.make_subbinary_unchecked(offset, bytes.len()) }
+                    .encode(self.env)
+            }
+            _ => self.copied_binary(bytes),
         }
-        // SAFETY: the bounds were checked just above.
-        Ok(unsafe { self.source.make_subbinary_unchecked(offset, bytes.len()) }.encode(self.env))
+    }
+
+    fn enter(&self) -> DResult<()> {
+        let depth = self.depth.get() + 1;
+        if depth > MAX_DEPTH {
+            return Err(Stop::Fallback);
+        }
+        self.depth.set(depth);
+        Ok(())
+    }
+
+    fn leave(&self) {
+        self.depth.set(self.depth.get() - 1);
     }
 
     fn copied_binary(&self, bytes: &[u8]) -> Term<'a> {
@@ -158,6 +193,13 @@ impl<'a> Ctx<'a> {
     }
 
     fn document(&self, doc: &RawDocument) -> DResult<Term<'a>> {
+        self.enter()?;
+        let result = self.document_fields(doc);
+        self.leave();
+        result
+    }
+
+    fn document_fields(&self, doc: &RawDocument) -> DResult<Term<'a>> {
         let mut keys: Terms = SmallVec::new();
         let mut values: Terms = SmallVec::new();
         for element in doc {
@@ -171,6 +213,13 @@ impl<'a> Ctx<'a> {
     }
 
     fn array(&self, array: &RawArray) -> DResult<Term<'a>> {
+        self.enter()?;
+        let result = self.array_elements(array);
+        self.leave();
+        result
+    }
+
+    fn array_elements(&self, array: &RawArray) -> DResult<Term<'a>> {
         let mut values: Terms = SmallVec::new();
         for element in array {
             values.push(self.value(element.map_err(|_| Stop::Fallback)?)?.as_c_arg());
@@ -192,7 +241,7 @@ impl<'a> Ctx<'a> {
         let env = self.env;
         Ok(match value {
             RawBsonRef::Double(f) => double(env, f)?,
-            RawBsonRef::String(s) | RawBsonRef::Symbol(s) => self.sub_binary(s.as_bytes())?,
+            RawBsonRef::String(s) | RawBsonRef::Symbol(s) => self.value_binary(s.as_bytes()),
             RawBsonRef::Document(d) => self.document(d)?,
             RawBsonRef::Array(a) => self.array(a)?,
             RawBsonRef::Boolean(b) => b.encode(env),
@@ -218,7 +267,7 @@ impl<'a> Ctx<'a> {
                 self.make_struct(
                     atoms::bson_binary(),
                     &[
-                        (atoms::binary(), self.sub_binary(bin.bytes)?),
+                        (atoms::binary(), self.value_binary(bin.bytes)),
                         (atoms::subtype(), subtype),
                     ],
                 )?
@@ -239,14 +288,14 @@ impl<'a> Ctx<'a> {
             RawBsonRef::JavaScriptCode(code) => self.make_struct(
                 atoms::bson_javascript(),
                 &[
-                    (atoms::code(), self.sub_binary(code.as_bytes())?),
+                    (atoms::code(), self.value_binary(code.as_bytes())),
                     (atoms::scope(), atoms::nil().encode(env)),
                 ],
             )?,
             RawBsonRef::JavaScriptCodeWithScope(js) => self.make_struct(
                 atoms::bson_javascript(),
                 &[
-                    (atoms::code(), self.sub_binary(js.code.as_bytes())?),
+                    (atoms::code(), self.value_binary(js.code.as_bytes())),
                     (atoms::scope(), self.document(js.scope)?),
                 ],
             )?,
@@ -278,6 +327,17 @@ impl<'a> Ctx<'a> {
         let (y, m, d) = civil_from_days(days);
         let secs = ms_of_day / 1000;
         let micro = (ms_of_day % 1000) * 1000;
+        let (time_zone, zone_abbr) = match self.utc.get() {
+            Some(utc) => utc,
+            None => {
+                let utc = (
+                    self.copied_binary(b"Etc/UTC").as_c_arg(),
+                    self.copied_binary(b"UTC").as_c_arg(),
+                );
+                self.utc.set(Some(utc));
+                utc
+            }
+        };
         self.make_struct(
             atoms::date_time(),
             &[
@@ -291,8 +351,9 @@ impl<'a> Ctx<'a> {
                 (atoms::microsecond(), (micro, 3).encode(env)),
                 (atoms::std_offset(), 0.encode(env)),
                 (atoms::utc_offset(), 0.encode(env)),
-                (atoms::time_zone(), self.copied_binary(b"Etc/UTC")),
-                (atoms::zone_abbr(), self.copied_binary(b"UTC")),
+                // SAFETY: both terms were made in this env.
+                (atoms::time_zone(), unsafe { Term::new(env, time_zone) }),
+                (atoms::zone_abbr(), unsafe { Term::new(env, zone_abbr) }),
             ],
         )
     }
@@ -331,16 +392,17 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Decodes the BSON document at the start of `binary`. Returns `{map, rest}`, `:fallback`,
-/// or raises `ArgumentError` for input that is not BSON.
+/// Decodes the BSON document at the start of `binary`. Returns `{map, rest}`, or `:fallback`
+/// (also for input that is not BSON, so that `BSON.Decoder` raises its usual error).
 fn document_impl<'a>(env: Env<'a>, binary: Binary<'a>) -> NifResult<Term<'a>> {
+    let fallback = Ok(atoms::fallback().encode(env));
     let bytes = binary.as_slice();
     if bytes.len() < 5 {
-        return Err(rustler::Error::BadArg);
+        return fallback;
     }
     let size = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     if size < 5 || size as usize > bytes.len() {
-        return Err(rustler::Error::BadArg);
+        return fallback;
     }
     let size = size as usize;
     let ctx = Ctx::new(env, binary);
@@ -353,7 +415,7 @@ fn document_impl<'a>(env: Env<'a>, binary: Binary<'a>) -> NifResult<Term<'a>> {
             let rest = binary.make_subbinary(size, bytes.len() - size)?;
             Ok((term, rest).encode(env))
         }
-        Err(Stop::Fallback) => Ok(atoms::fallback().encode(env)),
+        Err(Stop::Fallback) => fallback,
         Err(Stop::Invalid) => Err(rustler::Error::BadArg),
     }
 }
@@ -370,25 +432,34 @@ fn document_dirty<'a>(env: Env<'a>, binary: Binary<'a>) -> NifResult<Term<'a>> {
 }
 
 /// Decodes up to `count` documents from the body of a BSON array (the raw batch held by
-/// `BSON.LazyDocuments`). Returns `{docs, rest}`, or `:fallback` if any of them needs
-/// `BSON.Decoder`; the caller then decodes the same documents one by one.
+/// `BSON.LazyDocuments`), but no more than `max_bytes` of input, so a call stays short on a
+/// normal scheduler. Returns `{docs, rest}`, or `:fallback` if any of
+/// them needs `BSON.Decoder`, if the first one alone is larger than `max_bytes` (it belongs on
+/// a dirty scheduler), or if the batch is malformed; the caller then decodes the same
+/// documents one by one.
 #[rustler::nif]
-fn take<'a>(env: Env<'a>, binary: Binary<'a>, count: usize) -> NifResult<Term<'a>> {
+fn take<'a>(
+    env: Env<'a>,
+    binary: Binary<'a>,
+    count: usize,
+    max_bytes: usize,
+) -> NifResult<Term<'a>> {
+    let fallback = Ok(atoms::fallback().encode(env));
     let bytes = binary.as_slice();
     let ctx = Ctx::new(env, binary);
     let mut docs: SmallVec<[ErlNifTerm; 128]> = SmallVec::new();
     let mut pos = 0;
     while pos < bytes.len() && docs.len() < count {
         if bytes[pos] != 0x03 {
-            return Ok(atoms::fallback().encode(env));
+            return fallback;
         }
         let key_end = match bytes[pos + 1..].iter().position(|&b| b == 0) {
             Some(n) => pos + 1 + n,
-            None => return Err(rustler::Error::BadArg),
+            None => return fallback,
         };
         let start = key_end + 1;
         if start + 4 > bytes.len() {
-            return Err(rustler::Error::BadArg);
+            return fallback;
         }
         let size = i32::from_le_bytes([
             bytes[start],
@@ -397,16 +468,22 @@ fn take<'a>(env: Env<'a>, binary: Binary<'a>, count: usize) -> NifResult<Term<'a
             bytes[start + 3],
         ]);
         if size < 5 || start + size as usize > bytes.len() {
-            return Err(rustler::Error::BadArg);
+            return fallback;
         }
         let end = start + size as usize;
+        if end > max_bytes {
+            if docs.is_empty() {
+                return fallback;
+            }
+            break;
+        }
         let doc = match RawDocument::from_bytes(&bytes[start..end]) {
             Ok(doc) => doc,
-            Err(_) => return Ok(atoms::fallback().encode(env)),
+            Err(_) => return fallback,
         };
         match ctx.document(doc) {
             Ok(term) => docs.push(term.as_c_arg()),
-            Err(Stop::Fallback) => return Ok(atoms::fallback().encode(env)),
+            Err(Stop::Fallback) => return fallback,
             Err(Stop::Invalid) => return Err(rustler::Error::BadArg),
         }
         pos = end;

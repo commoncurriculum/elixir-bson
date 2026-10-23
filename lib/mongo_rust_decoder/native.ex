@@ -5,5 +5,5 @@ defmodule MongoRustDecoder.Native do
 
   def document(_binary), do: :erlang.nif_error(:nif_not_loaded)
   def document_dirty(_binary), do: :erlang.nif_error(:nif_not_loaded)
-  def take(_binary, _count), do: :erlang.nif_error(:nif_not_loaded)
+  def take(_binary, _count, _max_bytes), do: :erlang.nif_error(:nif_not_loaded)
 end

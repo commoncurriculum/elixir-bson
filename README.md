@@ -7,11 +7,15 @@ built on MongoDB's official [`bson`](https://crates.io/crates/bson) crate (its z
 It is a drop-in replacement for `BSON.Decoder`: it returns exactly the same terms. Documents
 with values it does not build natively are decoded by `BSON.Decoder` instead, so behaviour does
 not change. Those values are Decimal128, dates outside -9999..9999, DBPointer, NaN payloads
-other than the usual ones, invalid UTF-8, and duplicate keys.
+other than the usual ones, binary subtypes `BSON.Decoder` has no clause for (0x06 to 0x7F),
+invalid UTF-8, and duplicate keys. So are documents nested more than 128 levels deep (the
+recursion would otherwise overflow a scheduler's stack) and malformed input, for which
+`BSON.Decoder` raises its usual error. If the NIF fails to load, everything is decoded by
+`BSON.Decoder` and a warning is logged.
 
 ## Requirements
 
-- `mongodb_driver` 1.4 or later. Any release works, since they all read the `:decoder`
+- `mongodb_driver` 1.5 or later. Any such release works, since they all read the `:decoder`
   setting. With the lazy cursor batch change (`BSON.LazyDocuments`, for now on branch
   `claude/project-thread-cdrmxc` of `commoncurriculum/elixir-mongodb-driver`), getMore
   batches are also decoded in chunks while the next batch is fetched. That is the fastest
@@ -37,15 +41,17 @@ Key order is not preserved. Use `BSON.PreserveOrderDecoder` if you need that.
 ## How it works
 
 - `Mongo.Stream` keeps each cursor batch as raw BSON and asks the decoder for 100 documents at a
-  time (`take_lazy_documents/2`). The NIF decodes the whole chunk in one call and allocates
-  each distinct key binary only once per chunk.
-- String values are sub-binaries of the reply, as with `BSON.Decoder`. Keys are copied.
-- A document over 64 KB is decoded on a dirty CPU scheduler.
+  time (`take_lazy_documents/2`). The NIF decodes the chunk in one call, up to 32 KB of input
+  so that the call stays well under a millisecond, and allocates each distinct key binary only
+  once per chunk.
+- As with `BSON.Decoder`, strings and binaries of up to 64 bytes are copied, and longer ones
+  are sub-binaries of the reply. Keys are copied.
+- A document over 32 KB is decoded on a dirty CPU scheduler.
 
 ## Benchmark
 
 `bench/find.exs` runs `Mongo.find(conn, coll, %{}) |> Enum.count()` over 300,000 documents of
-about 256 bytes each. Setup: local MongoDB 8.0, Elixir 1.17.3, OTP 25.
+183 bytes each. Setup: local MongoDB 8.0, Elixir 1.17.3, OTP 25.
 
 | Batch size | mongodb_driver 1.6.4 | lazy batches (Elixir) | + MongoRustDecoder |
 |---|---|---|---|
@@ -69,9 +75,10 @@ Erlang terms on the BEAM heap.
 ```sh
 MIX_ENV=bench mix run bench/find.exs
 MIX_ENV=bench mix run bench/decode.exs
+cargo run --release --manifest-path bench/rust_raw/Cargo.toml   # the pure-Rust numbers
 ```
 
 ## Tests
 
-`mix test` checks every BSON type against `BSON.Decoder`, including the fallback cases, and runs
-a property test over 1,000 random documents.
+`mix test` checks every BSON type against `BSON.Decoder`, including the fallback cases, deep
+nesting and malformed input, and runs a property test over 1,000 random documents.

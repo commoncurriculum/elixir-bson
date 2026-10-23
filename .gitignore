@@ -3,3 +3,4 @@
 /native/*/target/
 /priv/native/
 erl_crash.dump
+/bench/rust_raw/target/

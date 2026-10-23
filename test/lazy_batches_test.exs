@@ -25,8 +25,24 @@ if Code.ensure_loaded?(BSON.LazyDocuments) do
 
       {reply, ""} = MongoRustDecoder.lazy_cursor_document(binary)
       lazy = reply["cursor"]["nextBatch"]
-      assert :fallback == MongoRustDecoder.Native.take(lazy.binary, 10)
+      assert :fallback == MongoRustDecoder.Native.take(lazy.binary, 10, 32 * 1024)
       assert {^docs, []} = BSON.LazyDocuments.take(lazy, 10)
+    end
+
+    test "a chunk holds at most 32 KB of input, and a larger first document is decoded on its own" do
+      docs = Enum.map(1..10, fn i -> %{"i" => i, "s" => String.duplicate("x", 10_000)} end) ++ [%{"big" => String.duplicate("y", 100_000)}, %{"i" => 11}]
+      binary = encode(%{"cursor" => %{"nextBatch" => docs, "id" => 0, "ns" => "db.c"}, "ok" => 1.0})
+      {reply, ""} = MongoRustDecoder.lazy_cursor_document(binary)
+      lazy = reply["cursor"]["nextBatch"]
+
+      {first, rest} = BSON.LazyDocuments.take(lazy, 100)
+      assert first == Enum.take(docs, 3)
+      assert Enum.to_list(rest) == Enum.drop(docs, 3)
+      assert {[_, _, _], rest} = BSON.LazyDocuments.take(rest, 100)
+      assert {[_, _, _], rest} = BSON.LazyDocuments.take(rest, 100)
+      assert {[%{"i" => 10}], rest} = BSON.LazyDocuments.take(rest, 100)
+      assert :fallback == MongoRustDecoder.Native.take(rest.binary, 100, 32 * 1024)
+      assert {[%{"big" => _}, %{"i" => 11}], []} = BSON.LazyDocuments.take(rest, 100)
     end
   end
 end

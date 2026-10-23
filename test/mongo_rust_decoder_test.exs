@@ -6,6 +6,13 @@ defmodule MongoRustDecoderTest do
 
   defp encode(doc), do: doc |> BSON.encode() |> IO.iodata_to_binary()
 
+  defp error_name(fun) do
+    fun.()
+    :no_error
+  rescue
+    error -> error.__struct__
+  end
+
   defp assert_same(binary) do
     expected = BSON.Decoder.decode(binary)
     assert MongoRustDecoder.decode(binary) == expected
@@ -93,9 +100,29 @@ defmodule MongoRustDecoderTest do
       assert_raise FunctionClauseError, fn -> MongoRustDecoder.decode(binary) end
     end
 
-    test "rejects truncated input" do
+    test "raises like BSON.Decoder on malformed input" do
       binary = encode(%{"a" => "b"})
-      assert_raise ArgumentError, fn -> MongoRustDecoder.decode(binary_part(binary, 0, byte_size(binary) - 2)) end
+
+      for bad <- [binary_part(binary, 0, byte_size(binary) - 2), "", <<1, 2, 3>>, <<200, 0, 0, 0, 0>>] do
+        assert error_name(fn -> BSON.Decoder.decode(bad) end) == error_name(fn -> MongoRustDecoder.decode(bad) end)
+      end
+    end
+
+    test "deeply nested documents fall back instead of overflowing the stack" do
+      for depth <- [127, 300, 1_000] do
+        nested = Enum.reduce(1..depth, %{"leaf" => 1}, fn _, acc -> %{"d" => acc} end)
+        assert_same(encode(nested))
+
+        # Large enough to be decoded on a dirty scheduler, whose stack is smaller.
+        padded = Enum.reduce(1..depth, %{"leaf" => String.duplicate("x", 40_000)}, fn _, acc -> %{"d" => acc} end)
+        assert_same(encode(padded))
+      end
+    end
+
+    test "short strings are copied, long ones refer to the reply" do
+      %{"short" => short, "long" => long} = MongoRustDecoder.decode(encode(%{"short" => "abc", "long" => String.duplicate("x", 100)}))
+      assert :binary.referenced_byte_size(short) == 3
+      assert :binary.referenced_byte_size(long) > 100
     end
 
     test "for large documents decoded on the dirty scheduler" do

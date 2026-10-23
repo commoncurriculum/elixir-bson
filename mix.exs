@@ -22,9 +22,9 @@ defmodule MongoRustDecoder.MixProject do
   defp deps do
     [
       {:rustler, "~> 0.39", runtime: false},
-      # Works with any release that has the :decoder setting. Batches are only decoded lazily,
-      # in chunks, with a driver that has BSON.LazyDocuments.
-      {:mongodb_driver, "~> 1.4"},
+      # 1.5 is the first release whose BSON.Decoder handles every NaN the NIF returns.
+      # Batches are only decoded lazily, in chunks, with a driver that has BSON.LazyDocuments.
+      {:mongodb_driver, "~> 1.5"},
       {:stream_data, "~> 1.1", only: :test}
     ]
   end
