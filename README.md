@@ -45,10 +45,14 @@ about 256 bytes each. Setup: local MongoDB 8.0, Elixir 1.17.3, OTP 25.
 
 | Batch size | mongodb_driver 1.6.4 | lazy batches (Elixir) | + MongoRustDecoder |
 |---|---|---|---|
-| default | 5.5 s | 1.25 s | 0.47 s |
-| 1,000 | 1.5 to 2.0 s | 1.4 s | 0.63 s |
-| 10,000 | 4.3 s | 1.15 s | 0.52 s |
-| 100,000 | 5.3 to 5.8 s | 1.1 to 1.2 s | 0.43 to 0.6 s |
+| default | 5.5 s | 0.95 s | 0.33 to 0.38 s |
+| 1,000 | 1.5 to 2.0 s | 1.1 s | 0.77 to 0.89 s |
+| 10,000 | 4.3 s | 1.0 to 1.15 s | 0.31 to 0.58 s |
+| 100,000 | 5.3 to 5.8 s | 2.7 to 2.9 s | 0.51 to 0.77 s |
+
+The first batch of a cursor is decoded in one go, so that `%Mongo.Stream{docs: docs}` stays a
+list; later batches are decoded 100 documents at a time while the next one is fetched. A very
+large `batch_size` therefore makes the first batch the slow part.
 
 Fetching the same batches without decoding takes about 0.3 s.
 
