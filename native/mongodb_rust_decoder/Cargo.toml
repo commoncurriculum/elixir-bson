@@ -1,0 +1,17 @@
+[package]
+name = "mongodb_rust_decoder"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mongodb_rust_decoder"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.39"
+bson = "3.1"
+smallvec = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
