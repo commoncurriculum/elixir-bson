@@ -8,10 +8,15 @@ It is a drop-in replacement for `BSON.Decoder`: it returns exactly the same term
 with values it does not build natively are decoded by `BSON.Decoder` instead, so behaviour does
 not change. Those values are Decimal128, dates outside -9999..9999, DBPointer, NaN payloads
 other than the usual ones, binary subtypes `BSON.Decoder` has no clause for (0x06 to 0x7F),
-invalid UTF-8, and duplicate keys. So are documents nested more than 128 levels deep (the
-recursion would otherwise overflow a scheduler's stack) and malformed input, for which
-`BSON.Decoder` raises its usual error. If the NIF fails to load, everything is decoded by
-`BSON.Decoder` and a warning is logged.
+invalid UTF-8, and duplicate keys. So are documents nested so deeply that decoding them would
+use more than 64 KB of the scheduler's stack (about 160 levels; MongoDB stores at most 100),
+and malformed input, for which `BSON.Decoder` raises its usual error.
+
+Data full of Decimal128 values gains little: each such document is decoded by `BSON.Decoder`.
+
+If the NIF cannot be loaded (for example, it was built for another platform), the decoder
+does not quietly fall back: a release fails to boot, and elsewhere every decode raises.
+Reloading the NIF in a running system (hot code upgrade) is not supported.
 
 ## Requirements
 
@@ -21,7 +26,7 @@ recursion would otherwise overflow a scheduler's stack) and malformed input, for
   batches are also decoded in chunks while the next batch is fetched. That is the fastest
   setup; see the benchmark below. To use the branch, add
   `{:mongodb_driver, github: "commoncurriculum/elixir-mongodb-driver", branch: "claude/project-thread-cdrmxc", override: true}`.
-- A Rust toolchain at compile time.
+- Rust 1.91 or later at compile time.
 
 ## Usage
 
@@ -41,9 +46,9 @@ Key order is not preserved. Use `BSON.PreserveOrderDecoder` if you need that.
 ## How it works
 
 - `Mongo.Stream` keeps each cursor batch as raw BSON and asks the decoder for 100 documents at a
-  time (`take_lazy_documents/2`). The NIF decodes the chunk in one call, up to 32 KB of input
-  so that the call stays well under a millisecond, and allocates each distinct key binary only
-  once per chunk.
+  time (`take_lazy_documents/2`). The NIF decodes the chunk in one call, up to 16 KB of input
+  so that the call stays well under a millisecond, and charges that time to the scheduler. It
+  allocates each key binary only once per chunk, for the first 64 distinct keys.
 - As with `BSON.Decoder`, strings and binaries of up to 64 bytes are copied, and longer ones
   are sub-binaries of the reply. Keys are copied.
 - A document over 32 KB is decoded on a dirty CPU scheduler.
@@ -55,10 +60,10 @@ Key order is not preserved. Use `BSON.PreserveOrderDecoder` if you need that.
 
 | Batch size | mongodb_driver 1.6.4 | lazy batches (Elixir) | + MongoRustDecoder |
 |---|---|---|---|
-| default | 5.5 s | 0.9 to 1.0 s | 0.31 to 0.34 s |
-| 1,000 | 1.5 to 2.0 s | 0.9 to 1.0 s | 0.62 to 0.84 s |
-| 10,000 | 4.3 s | 0.9 to 1.05 s | 0.39 to 0.43 s |
-| 100,000 | 5.3 to 5.8 s | 1.7 to 1.9 s | 0.42 to 0.50 s |
+| default | 5.5 s | 0.8 s | 0.28 to 0.32 s |
+| 1,000 | 1.5 to 2.0 s | 0.7 to 0.85 s | 0.52 to 0.57 s |
+| 10,000 | 4.3 s | 0.8 to 0.95 s | 0.27 to 0.40 s |
+| 100,000 | 5.3 to 5.8 s | 1.4 to 1.6 s | 0.51 to 0.52 s |
 
 With a batch size of 1,000, the read takes 300 getMore round trips. MongoDB alone needs about
 0.27 s to serve them, measured with a raw socket and no driver, so small batches cost the most.
@@ -86,4 +91,10 @@ cargo run --release --manifest-path bench/rust_raw/Cargo.toml   # the pure-Rust 
 ## Tests
 
 `mix test` checks every BSON type against `BSON.Decoder`, including the fallback cases, deep
-nesting and malformed input, and runs a property test over 1,000 random documents.
+nesting and malformed input. Property tests compare 1,000 random documents, and 300 random
+batches decoded in chunks, with `BSON.Decoder`. To check deep nesting on the smallest
+scheduler stacks, run `ELIXIR_ERL_OPTIONS="+sss 20 +sssdcpu 20" mix test`.
+
+## License
+
+Apache-2.0, like `mongodb_driver`.

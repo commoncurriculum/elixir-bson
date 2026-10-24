@@ -5,32 +5,42 @@
 //! itself (Decimal128, dates outside the range `BSON.Decoder` accepts, unusual NaN
 //! payloads, binary subtypes `BSON.Decoder` rejects, duplicate keys, invalid UTF-8)
 //! make the call return `:fallback`, and the Elixir side then decodes that document
-//! with `BSON.Decoder`, so behaviour stays identical. So do documents nested deeper than
-//! `MAX_DEPTH` (the recursion would otherwise overflow a scheduler's stack), DBPointer, and
+//! with `BSON.Decoder`, so behaviour stays identical. So do documents nested so deeply that
+//! the recursion would use more than `STACK_BUDGET` of the scheduler's stack, DBPointer, and
 //! malformed input, for which `BSON.Decoder` raises its own error.
 
 use bson::raw::{RawArray, RawBsonRef, RawDocument};
 use bson::spec::BinarySubtype;
 use rustler::sys::{enif_make_list_from_array, enif_make_map_from_arrays, ErlNifTerm};
 use rustler::types::binary::{Binary, NewBinary};
-use rustler::{Atom, Encoder, Env, NifResult, Term};
+use rustler::{Atom, Encoder, Env, Term};
 use smallvec::SmallVec;
-use std::cell::{Cell, RefCell};
 use std::mem::MaybeUninit;
 
-/// Nesting limit. Each level takes about 1.6 KB of native stack, and a dirty scheduler's stack
-/// is 320 KB by default; MongoDB itself stores documents up to 100 levels deep.
-const MAX_DEPTH: u32 = 128;
+/// Native stack a call may use for its recursion. Scheduler stacks can be as small as 160 KB
+/// (`+sss 20`, `+sssdcpu 20`), part of which the VM has already used when the NIF is called.
+/// Deeper documents are left to `BSON.Decoder`.
+const STACK_BUDGET: usize = 64 * 1024;
+
+/// Input decoded per 1% of a scheduler timeslice (1 ms): dense documents decode at about
+/// 40 KB/ms.
+const BYTES_PER_PERCENT: usize = 400;
+
+/// Array index keys ("0", "1", ...) are at most this long.
+const MAX_INDEX_KEY: usize = 20;
 
 /// Strings and binaries up to this size are copied, like `BSON.Decoder` does (the BEAM copies
 /// sub-binaries of up to 64 bytes); longer ones are sub-binaries of the reply.
 const COPY_LIMIT: usize = 64;
 
-/// Most documents have few fields, so keep their terms on the stack.
-type Terms = SmallVec<[ErlNifTerm; 16]>;
+/// The fields of a struct (13 for DateTime, with `__struct__`).
+type StructFields = SmallVec<[ErlNifTerm; 13]>;
 
-/// Key bytes and the binary term made for them.
-type KeyCache<'a> = SmallVec<[(&'a [u8], ErlNifTerm); 32]>;
+/// How many distinct keys a call caches.
+const KEY_CACHE_SIZE: usize = 64;
+
+/// Key strings and the binary terms made for them.
+type KeyCache<'a> = SmallVec<[(&'a str, ErlNifTerm); KEY_CACHE_SIZE]>;
 
 mod atoms {
     rustler::atoms! {
@@ -78,227 +88,176 @@ mod atoms {
     }
 }
 
-/// Why decoding stopped: either hand the document to `BSON.Decoder`, or the input is not valid BSON.
-enum Stop {
-    Fallback,
-    Invalid,
-}
-
-type DResult<T> = Result<T, Stop>;
+/// `None` means: hand this document to `BSON.Decoder` (which also raises on invalid input).
+type Decoded<'a> = Option<Term<'a>>;
 
 struct Ctx<'a> {
     env: Env<'a>,
-    /// The binary term being decoded; strings become sub-binaries of it.
+    /// The binary term being decoded; long strings become sub-binaries of it.
     source: Binary<'a>,
-    base: usize,
-    /// Key binaries already made in this call. Documents of a batch share their keys,
-    /// so each distinct key is allocated once per call instead of once per document.
-    keys: RefCell<KeyCache<'a>>,
-    depth: Cell<u32>,
+    /// Key binaries already made in this call: the documents of a batch share their keys.
+    key_cache: KeyCache<'a>,
+    /// The keys and values of the documents and arrays being decoded, innermost last. One
+    /// buffer for the whole call keeps the recursion's stack frames small, and is reused by
+    /// every document.
+    keys: Vec<ErlNifTerm>,
+    values: Vec<ErlNifTerm>,
     /// The "Etc/UTC" and "UTC" binaries of DateTime structs, made once per call.
-    utc: Cell<Option<(ErlNifTerm, ErlNifTerm)>>,
+    utc: Option<(Term<'a>, Term<'a>)>,
+    /// The stack address below which the recursion stops (stacks grow down).
+    stack_limit: usize,
 }
 
 impl<'a> Ctx<'a> {
     fn new(env: Env<'a>, source: Binary<'a>) -> Self {
-        let base = source.as_slice().as_ptr() as usize;
         Ctx {
             env,
             source,
-            base,
-            keys: RefCell::new(SmallVec::new()),
-            depth: Cell::new(0),
-            utc: Cell::new(None),
+            key_cache: SmallVec::new(),
+            keys: Vec::with_capacity(64),
+            values: Vec::with_capacity(64),
+            utc: None,
+            stack_limit: stack_address().saturating_sub(STACK_BUDGET),
         }
     }
 
-    /// The offset of `bytes` in the source binary, if the slice lies within it.
-    fn offset_in_source(&self, bytes: &[u8]) -> Option<usize> {
-        let offset = (bytes.as_ptr() as usize).checked_sub(self.base)?;
-        (offset.checked_add(bytes.len())? <= self.source.len()).then_some(offset)
-    }
-
-    fn key(&self, key: &[u8]) -> ErlNifTerm {
-        let mut cache = self.keys.borrow_mut();
-        if let Some((_, term)) = cache.iter().find(|(k, _)| *k == key) {
+    fn key(&mut self, key: &'a str) -> ErlNifTerm {
+        if let Some((_, term)) = self.key_cache.iter().find(|(k, _)| *k == key) {
             return *term;
         }
-        let term = self.copied_binary(key).as_c_arg();
-        if cache.len() < 64 {
-            // Keys point into the source binary, which outlives this call's Ctx.
-            if let Some(offset) = self.offset_in_source(key) {
-                cache.push((&self.source.as_slice()[offset..offset + key.len()], term));
-            }
+        // Copied, like BSON.Decoder does, so keys don't keep the reply binary alive.
+        let term = copied_binary(self.env, key.as_bytes()).as_c_arg();
+        if self.key_cache.len() < KEY_CACHE_SIZE {
+            self.key_cache.push((key, term));
         }
         term
     }
 
     /// A string or binary value: a sub-binary of the source if it is long, so it is not copied.
-    fn value_binary(&self, bytes: &[u8]) -> Term<'a> {
-        match self.offset_in_source(bytes) {
-            Some(offset) if bytes.len() > COPY_LIMIT => {
-                // SAFETY: offset_in_source checked the bounds.
-                unsafe { self.source.make_subbinary_unchecked(offset, bytes.len()) }
-                    .encode(self.env)
-            }
-            _ => self.copied_binary(bytes),
+    fn value_binary(&self, bytes: &'a [u8]) -> Term<'a> {
+        if bytes.len() <= COPY_LIMIT {
+            return copied_binary(self.env, bytes);
         }
+        let offset = (bytes.as_ptr() as usize)
+            .checked_sub(self.source.as_slice().as_ptr() as usize)
+            .expect("decoded slices lie within the source binary");
+        // SAFETY: every slice decoded here lies within the source binary.
+        unsafe { self.source.make_subbinary_unchecked(offset, bytes.len()) }.encode(self.env)
     }
 
-    fn enter(&self) -> DResult<()> {
-        let depth = self.depth.get() + 1;
-        if depth > MAX_DEPTH {
-            return Err(Stop::Fallback);
+    fn document(&mut self, doc: &'a RawDocument) -> Decoded<'a> {
+        if stack_address() < self.stack_limit {
+            return None;
         }
-        self.depth.set(depth);
-        Ok(())
-    }
-
-    fn leave(&self) {
-        self.depth.set(self.depth.get() - 1);
-    }
-
-    fn copied_binary(&self, bytes: &[u8]) -> Term<'a> {
-        let mut bin = NewBinary::new(self.env, bytes.len());
-        bin.as_mut_slice().copy_from_slice(bytes);
-        Term::from(bin)
-    }
-
-    /// enif_make_map_from_arrays without the extra copies of rustler's wrapper. `None` on duplicate keys.
-    fn map(&self, keys: &[ErlNifTerm], values: &[ErlNifTerm]) -> Option<Term<'a>> {
-        let mut map = MaybeUninit::uninit();
-        // SAFETY: both slices hold valid terms of this env and have the same length.
-        let ok = unsafe {
-            enif_make_map_from_arrays(
-                self.env.as_c_arg(),
-                keys.as_ptr(),
-                values.as_ptr(),
-                keys.len(),
-                map.as_mut_ptr(),
-            )
-        };
-        (ok != 0).then(|| unsafe { Term::new(self.env, map.assume_init()) })
-    }
-
-    fn make_struct(&self, name: Atom, fields: &[(Atom, Term<'a>)]) -> DResult<Term<'a>> {
-        let mut keys: Terms = SmallVec::new();
-        let mut values: Terms = SmallVec::new();
-        keys.push(atoms::__struct__().to_term(self.env).as_c_arg());
-        values.push(name.to_term(self.env).as_c_arg());
-        for (k, v) in fields {
-            keys.push(k.to_term(self.env).as_c_arg());
-            values.push(v.as_c_arg());
-        }
-        self.map(&keys, &values).ok_or(Stop::Invalid)
-    }
-
-    fn document(&self, doc: &RawDocument) -> DResult<Term<'a>> {
-        self.enter()?;
-        let result = self.document_fields(doc);
-        self.leave();
-        result
-    }
-
-    fn document_fields(&self, doc: &RawDocument) -> DResult<Term<'a>> {
-        let mut keys: Terms = SmallVec::new();
-        let mut values: Terms = SmallVec::new();
+        let (keys_start, values_start) = (self.keys.len(), self.values.len());
         for element in doc {
-            let (key, value) = element.map_err(|_| Stop::Fallback)?;
-            // Keys are copied, like BSON.Decoder does, so they don't keep the reply binary alive.
-            keys.push(self.key(key.as_str().as_bytes()));
-            values.push(self.value(value)?.as_c_arg());
+            let (key, value) = element.ok()?;
+            let key = self.key(key.as_str());
+            self.keys.push(key);
+            // A nested document or array pushes its own fields, and pops them again.
+            let value = self.value(value)?;
+            self.values.push(value.as_c_arg());
         }
         // Fails on duplicate keys; BSON.Decoder keeps the first one, so let it decide.
-        self.map(&keys, &values).ok_or(Stop::Fallback)
+        let map = make_map(
+            self.env,
+            &self.keys[keys_start..],
+            &self.values[values_start..],
+        );
+        self.keys.truncate(keys_start);
+        self.values.truncate(values_start);
+        map
     }
 
-    fn array(&self, array: &RawArray) -> DResult<Term<'a>> {
-        self.enter()?;
-        let result = self.array_elements(array);
-        self.leave();
-        result
-    }
-
-    fn array_elements(&self, array: &RawArray) -> DResult<Term<'a>> {
-        let mut values: Terms = SmallVec::new();
-        for element in array {
-            values.push(self.value(element.map_err(|_| Stop::Fallback)?)?.as_c_arg());
+    fn array(&mut self, array: &'a RawArray) -> Decoded<'a> {
+        if stack_address() < self.stack_limit {
+            return None;
         }
-        // SAFETY: every element is a valid term of this env.
-        Ok(unsafe {
-            Term::new(
-                self.env,
-                enif_make_list_from_array(
-                    self.env.as_c_arg(),
-                    values.as_ptr(),
-                    values.len() as u32,
-                ),
-            )
-        })
+        let values_start = self.values.len();
+        for element in array {
+            let value = self.value(element.ok()?)?;
+            self.values.push(value.as_c_arg());
+        }
+        let list = make_list(self.env, &self.values[values_start..]);
+        self.values.truncate(values_start);
+        list
     }
 
-    fn value(&self, value: RawBsonRef<'_>) -> DResult<Term<'a>> {
+    /// Only the recursive cases are handled here, so that this frame, which is on the stack
+    /// once per nesting level, stays small.
+    fn value(&mut self, value: RawBsonRef<'a>) -> Decoded<'a> {
+        match value {
+            RawBsonRef::Document(d) => self.document(d),
+            RawBsonRef::Array(a) => self.array(a),
+            RawBsonRef::JavaScriptCodeWithScope(js) => {
+                let scope = self.document(js.scope)?;
+                Some(self.make_struct(
+                    atoms::bson_javascript(),
+                    &[
+                        (atoms::code(), self.value_binary(js.code.as_bytes())),
+                        (atoms::scope(), scope),
+                    ],
+                ))
+            }
+            value => self.scalar(value),
+        }
+    }
+
+    #[inline(never)]
+    fn make_struct(&self, name: Atom, fields: &[(Atom, Term<'a>)]) -> Term<'a> {
         let env = self.env;
-        Ok(match value {
+        let mut keys = StructFields::new();
+        let mut values = StructFields::new();
+        keys.push(atoms::__struct__().to_term(env).as_c_arg());
+        values.push(name.to_term(env).as_c_arg());
+        for (k, v) in fields {
+            keys.push(k.to_term(env).as_c_arg());
+            values.push(v.as_c_arg());
+        }
+        make_map(env, &keys, &values).expect("struct fields are distinct atoms")
+    }
+
+    #[inline(never)]
+    fn scalar(&mut self, value: RawBsonRef<'a>) -> Decoded<'a> {
+        let env = self.env;
+        Some(match value {
             RawBsonRef::Double(f) => double(env, f)?,
             RawBsonRef::String(s) | RawBsonRef::Symbol(s) => self.value_binary(s.as_bytes()),
-            RawBsonRef::Document(d) => self.document(d)?,
-            RawBsonRef::Array(a) => self.array(a)?,
             RawBsonRef::Boolean(b) => b.encode(env),
             RawBsonRef::Null | RawBsonRef::Undefined => atoms::nil().encode(env),
             RawBsonRef::Int32(i) => i.encode(env),
             RawBsonRef::Int64(i) => i.encode(env),
             RawBsonRef::ObjectId(oid) => self.make_struct(
                 atoms::bson_object_id(),
-                &[(atoms::value(), self.copied_binary(&oid.bytes()))],
-            )?,
-            RawBsonRef::Binary(bin) => {
-                let subtype = match bin.subtype {
-                    BinarySubtype::Generic => atoms::generic().encode(env),
-                    BinarySubtype::Function => atoms::function().encode(env),
-                    BinarySubtype::BinaryOld => atoms::binary_old().encode(env),
-                    BinarySubtype::UuidOld => atoms::uuid_old().encode(env),
-                    BinarySubtype::Uuid => atoms::uuid().encode(env),
-                    BinarySubtype::Md5 => atoms::md5().encode(env),
-                    BinarySubtype::UserDefined(n) => n.encode(env),
-                    // BSON.Decoder has no clause for these subtypes; keep its behaviour.
-                    _ => return Err(Stop::Fallback),
-                };
-                self.make_struct(
-                    atoms::bson_binary(),
-                    &[
-                        (atoms::binary(), self.value_binary(bin.bytes)),
-                        (atoms::subtype(), subtype),
-                    ],
-                )?
-            }
+                &[(atoms::value(), copied_binary(env, &oid.bytes()))],
+            ),
+            RawBsonRef::Binary(bin) => self.make_struct(
+                atoms::bson_binary(),
+                &[
+                    (atoms::binary(), self.value_binary(bin.bytes)),
+                    (atoms::subtype(), binary_subtype(env, bin.subtype)?),
+                ],
+            ),
             RawBsonRef::RegularExpression(re) => self.make_struct(
                 atoms::bson_regex(),
                 &[
                     (
                         atoms::pattern(),
-                        self.copied_binary(re.pattern.as_str().as_bytes()),
+                        copied_binary(env, re.pattern.as_str().as_bytes()),
                     ),
                     (
                         atoms::options(),
-                        self.copied_binary(re.options.as_str().as_bytes()),
+                        copied_binary(env, re.options.as_str().as_bytes()),
                     ),
                 ],
-            )?,
+            ),
             RawBsonRef::JavaScriptCode(code) => self.make_struct(
                 atoms::bson_javascript(),
                 &[
                     (atoms::code(), self.value_binary(code.as_bytes())),
                     (atoms::scope(), atoms::nil().encode(env)),
                 ],
-            )?,
-            RawBsonRef::JavaScriptCodeWithScope(js) => self.make_struct(
-                atoms::bson_javascript(),
-                &[
-                    (atoms::code(), self.value_binary(js.code.as_bytes())),
-                    (atoms::scope(), self.document(js.scope)?),
-                ],
-            )?,
+            ),
             // BSON.Decoder reads both halves as signed 32-bit integers.
             RawBsonRef::Timestamp(ts) => self.make_struct(
                 atoms::bson_timestamp(),
@@ -306,39 +265,33 @@ impl<'a> Ctx<'a> {
                     (atoms::value(), (ts.time as i32).encode(env)),
                     (atoms::ordinal(), (ts.increment as i32).encode(env)),
                 ],
-            )?,
+            ),
             RawBsonRef::DateTime(dt) => self.date_time(dt.timestamp_millis())?,
             RawBsonRef::MinKey => atoms::bson_min().encode(env),
             RawBsonRef::MaxKey => atoms::bson_max().encode(env),
-            RawBsonRef::Decimal128(_) | RawBsonRef::DbPointer(_) => return Err(Stop::Fallback),
+            RawBsonRef::Decimal128(_) | RawBsonRef::DbPointer(_) => return None,
+            RawBsonRef::Document(_)
+            | RawBsonRef::Array(_)
+            | RawBsonRef::JavaScriptCodeWithScope(_) => unreachable!("handled by value()"),
         })
     }
 
-    fn date_time(&self, unix_ms: i64) -> DResult<Term<'a>> {
+    fn date_time(&mut self, unix_ms: i64) -> Decoded<'a> {
         // BSON.Decoder clamps (and logs) outside -9999-01-01..9999-12-31; leave that to it.
         const UNIX_START: i64 = -377_705_116_800_000;
         const UNIX_END: i64 = 253_402_300_799_999;
         if !(UNIX_START..=UNIX_END).contains(&unix_ms) {
-            return Err(Stop::Fallback);
+            return None;
         }
         let env = self.env;
-        let days = unix_ms.div_euclid(86_400_000);
+        let (y, m, d) = civil_from_days(unix_ms.div_euclid(86_400_000));
         let ms_of_day = unix_ms.rem_euclid(86_400_000);
-        let (y, m, d) = civil_from_days(days);
         let secs = ms_of_day / 1000;
         let micro = (ms_of_day % 1000) * 1000;
-        let (time_zone, zone_abbr) = match self.utc.get() {
-            Some(utc) => utc,
-            None => {
-                let utc = (
-                    self.copied_binary(b"Etc/UTC").as_c_arg(),
-                    self.copied_binary(b"UTC").as_c_arg(),
-                );
-                self.utc.set(Some(utc));
-                utc
-            }
-        };
-        self.make_struct(
+        let (time_zone, zone_abbr) = *self
+            .utc
+            .get_or_insert_with(|| (copied_binary(env, b"Etc/UTC"), copied_binary(env, b"UTC")));
+        Some(self.make_struct(
             atoms::date_time(),
             &[
                 (atoms::calendar(), atoms::calendar_iso().encode(env)),
@@ -351,31 +304,90 @@ impl<'a> Ctx<'a> {
                 (atoms::microsecond(), (micro, 3).encode(env)),
                 (atoms::std_offset(), 0.encode(env)),
                 (atoms::utc_offset(), 0.encode(env)),
-                // SAFETY: both terms were made in this env.
-                (atoms::time_zone(), unsafe { Term::new(env, time_zone) }),
-                (atoms::zone_abbr(), unsafe { Term::new(env, zone_abbr) }),
+                (atoms::time_zone(), time_zone),
+                (atoms::zone_abbr(), zone_abbr),
             ],
-        )
+        ))
     }
 }
 
-fn double(env: Env<'_>, f: f64) -> DResult<Term<'_>> {
+fn copied_binary<'a>(env: Env<'a>, bytes: &[u8]) -> Term<'a> {
+    let mut bin = NewBinary::new(env, bytes.len());
+    bin.as_mut_slice().copy_from_slice(bytes);
+    Term::from(bin)
+}
+
+/// enif_make_map_from_arrays without the extra copies of rustler's wrapper. `None` on duplicate keys.
+fn make_map<'a>(env: Env<'a>, keys: &[ErlNifTerm], values: &[ErlNifTerm]) -> Option<Term<'a>> {
+    let mut map = MaybeUninit::uninit();
+    // SAFETY: both slices hold valid terms of this env and have the same length.
+    let ok = unsafe {
+        enif_make_map_from_arrays(
+            env.as_c_arg(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            keys.len(),
+            map.as_mut_ptr(),
+        )
+    };
+    (ok != 0).then(|| unsafe { Term::new(env, map.assume_init()) })
+}
+
+fn make_list<'a>(env: Env<'a>, items: &[ErlNifTerm]) -> Option<Term<'a>> {
+    let len = u32::try_from(items.len()).ok()?;
+    // SAFETY: every element is a valid term of this env.
+    Some(unsafe {
+        Term::new(
+            env,
+            enif_make_list_from_array(env.as_c_arg(), items.as_ptr(), len),
+        )
+    })
+}
+
+/// The current stack address, approximately.
+#[inline(always)]
+fn stack_address() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
+}
+
+/// Charges the scheduler for the time spent decoding `bytes` of input.
+fn consume_timeslice(env: Env<'_>, bytes: usize) {
+    let percent = (bytes / BYTES_PER_PERCENT).clamp(1, 100);
+    rustler::schedule::consume_timeslice(env, percent as i32);
+}
+
+fn binary_subtype(env: Env<'_>, subtype: BinarySubtype) -> Decoded<'_> {
+    Some(match subtype {
+        BinarySubtype::Generic => atoms::generic().encode(env),
+        BinarySubtype::Function => atoms::function().encode(env),
+        BinarySubtype::BinaryOld => atoms::binary_old().encode(env),
+        BinarySubtype::UuidOld => atoms::uuid_old().encode(env),
+        BinarySubtype::Uuid => atoms::uuid().encode(env),
+        BinarySubtype::Md5 => atoms::md5().encode(env),
+        BinarySubtype::UserDefined(n) => n.encode(env),
+        // BSON.Decoder has no clause for these subtypes; keep its behaviour.
+        _ => return None,
+    })
+}
+
+fn double(env: Env<'_>, f: f64) -> Decoded<'_> {
     if f.is_nan() {
         // BSON.Decoder only recognises these NaN encodings.
         return match f.to_bits() {
             0x7FF8_0000_0000_0000 | 0xFFF8_0000_0000_0000 | 0x7FF0_0000_0000_0001 => {
-                Ok(atoms::nan().encode(env))
+                Some(atoms::nan().encode(env))
             }
-            _ => Err(Stop::Fallback),
+            _ => None,
         };
     }
-    if f == f64::INFINITY {
-        return Ok(atoms::inf().encode(env));
-    }
-    if f == f64::NEG_INFINITY {
-        return Ok(atoms::neg_inf().encode(env));
-    }
-    Ok(f.encode(env))
+    Some(if f == f64::INFINITY {
+        atoms::inf().encode(env)
+    } else if f == f64::NEG_INFINITY {
+        atoms::neg_inf().encode(env)
+    } else {
+        f.encode(env)
+    })
 }
 
 /// Howard Hinnant's days-to-civil algorithm, valid for the whole proleptic Gregorian calendar.
@@ -392,111 +404,86 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Decodes the BSON document at the start of `binary`. Returns `{map, rest}`, or `:fallback`
-/// (also for input that is not BSON, so that `BSON.Decoder` raises its usual error).
-fn document_impl<'a>(env: Env<'a>, binary: Binary<'a>) -> NifResult<Term<'a>> {
-    let fallback = Ok(atoms::fallback().encode(env));
-    let bytes = binary.as_slice();
-    if bytes.len() < 5 {
-        return fallback;
+/// The document framed at the start of `bytes` (by its int32 size header).
+fn framed(bytes: &[u8]) -> Option<&RawDocument> {
+    let size = i32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+    RawDocument::from_bytes(bytes.get(..usize::try_from(size).ok()?)?).ok()
+}
+
+/// The document of the array element at the start of `bytes` (type 0x03, then its index key).
+fn element_document(bytes: &[u8]) -> Option<(usize, &RawDocument)> {
+    let (&type_byte, rest) = bytes.split_first()?;
+    if type_byte != 0x03 {
+        return None;
     }
-    let size = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if size < 5 || size as usize > bytes.len() {
-        return fallback;
-    }
-    let size = size as usize;
-    let ctx = Ctx::new(env, binary);
-    let doc = match RawDocument::from_bytes(&bytes[..size]) {
-        Ok(doc) => doc,
-        Err(_) => return Ok(atoms::fallback().encode(env)),
+    let key_len = rest.iter().take(MAX_INDEX_KEY + 1).position(|&b| b == 0)?;
+    let start = 1 + key_len + 1;
+    framed(&bytes[start..]).map(|doc| (start, doc))
+}
+
+/// `dirty`: on a dirty scheduler, which has no timeslice to charge.
+fn decode_one<'a>(env: Env<'a>, binary: Binary<'a>, dirty: bool) -> Term<'a> {
+    let bytes: &'a [u8] = binary.as_slice();
+    let mut ctx = Ctx::new(env, binary);
+    let Some(doc) = framed(bytes) else {
+        return atoms::fallback().encode(env);
     };
+    let size = doc.as_bytes().len();
+    if !dirty {
+        consume_timeslice(env, size);
+    }
     match ctx.document(doc) {
-        Ok(term) => {
-            let rest = binary.make_subbinary(size, bytes.len() - size)?;
-            Ok((term, rest).encode(env))
-        }
-        Err(Stop::Fallback) => fallback,
-        Err(Stop::Invalid) => Err(rustler::Error::BadArg),
+        // SAFETY: size <= bytes.len().
+        Some(term) => (term, unsafe {
+            binary.make_subbinary_unchecked(size, bytes.len() - size)
+        })
+            .encode(env),
+        None => atoms::fallback().encode(env),
     }
 }
 
+/// Decodes the BSON document at the start of `binary`. Returns `{map, rest}`, or `:fallback`
+/// (also for input that is not BSON, so that `BSON.Decoder` raises its usual error).
 #[rustler::nif]
-fn document<'a>(env: Env<'a>, binary: Binary<'a>) -> NifResult<Term<'a>> {
-    document_impl(env, binary)
+fn document<'a>(env: Env<'a>, binary: Binary<'a>) -> Term<'a> {
+    decode_one(env, binary, false)
 }
 
 /// Same as `document/1`, on a dirty CPU scheduler, for large inputs.
 #[rustler::nif(schedule = "DirtyCpu")]
-fn document_dirty<'a>(env: Env<'a>, binary: Binary<'a>) -> NifResult<Term<'a>> {
-    document_impl(env, binary)
+fn document_dirty<'a>(env: Env<'a>, binary: Binary<'a>) -> Term<'a> {
+    decode_one(env, binary, true)
 }
 
 /// Decodes up to `count` documents from the body of a BSON array (the raw batch held by
-/// `BSON.LazyDocuments`), but no more than `max_bytes` of input, so a call stays short on a
-/// normal scheduler. Returns `{docs, rest}`, or `:fallback` if any of
-/// them needs `BSON.Decoder`, if the first one alone is larger than `max_bytes` (it belongs on
-/// a dirty scheduler), or if the batch is malformed; the caller then decodes the same
-/// documents one by one.
+/// `BSON.LazyDocuments`), within `max_bytes` of input so a call stays short. Returns
+/// `{docs, rest}`; it stops early, before the element at the start of `rest`, at an element
+/// it cannot decode natively or that does not fit the budget, which the caller decodes on its own.
 #[rustler::nif]
-fn take<'a>(
-    env: Env<'a>,
-    binary: Binary<'a>,
-    count: usize,
-    max_bytes: usize,
-) -> NifResult<Term<'a>> {
-    let fallback = Ok(atoms::fallback().encode(env));
-    let bytes = binary.as_slice();
-    let ctx = Ctx::new(env, binary);
+fn take<'a>(env: Env<'a>, binary: Binary<'a>, count: usize, max_bytes: usize) -> Term<'a> {
+    let bytes: &'a [u8] = binary.as_slice();
+    let mut ctx = Ctx::new(env, binary);
     let mut docs: SmallVec<[ErlNifTerm; 128]> = SmallVec::new();
     let mut pos = 0;
-    while pos < bytes.len() && docs.len() < count {
-        if bytes[pos] != 0x03 {
-            return fallback;
-        }
-        let key_end = match bytes[pos + 1..].iter().position(|&b| b == 0) {
-            Some(n) => pos + 1 + n,
-            None => return fallback,
+    while docs.len() < count {
+        let Some((start, doc)) = element_document(&bytes[pos..]) else {
+            break;
         };
-        let start = key_end + 1;
-        if start + 4 > bytes.len() {
-            return fallback;
-        }
-        let size = i32::from_le_bytes([
-            bytes[start],
-            bytes[start + 1],
-            bytes[start + 2],
-            bytes[start + 3],
-        ]);
-        if size < 5 || start + size as usize > bytes.len() {
-            return fallback;
-        }
-        let end = start + size as usize;
+        let end = pos + start + doc.as_bytes().len();
         if end > max_bytes {
-            if docs.is_empty() {
-                return fallback;
-            }
             break;
         }
-        let doc = match RawDocument::from_bytes(&bytes[start..end]) {
-            Ok(doc) => doc,
-            Err(_) => return fallback,
+        let Some(term) = ctx.document(doc) else {
+            break;
         };
-        match ctx.document(doc) {
-            Ok(term) => docs.push(term.as_c_arg()),
-            Err(Stop::Fallback) => return fallback,
-            Err(Stop::Invalid) => return Err(rustler::Error::BadArg),
-        }
+        docs.push(term.as_c_arg());
         pos = end;
     }
-    // SAFETY: every element is a valid term of this env.
-    let list = unsafe {
-        Term::new(
-            env,
-            enif_make_list_from_array(env.as_c_arg(), docs.as_ptr(), docs.len() as u32),
-        )
-    };
-    let rest = binary.make_subbinary(pos, bytes.len() - pos)?;
-    Ok((list, rest).encode(env))
+    consume_timeslice(env, pos);
+    // SAFETY: pos <= bytes.len().
+    let rest = unsafe { binary.make_subbinary_unchecked(pos, bytes.len() - pos) };
+    let docs = make_list(env, &docs).expect("count is a small chunk size");
+    (docs, rest).encode(env)
 }
 
 rustler::init!("Elixir.MongoRustDecoder.Native");

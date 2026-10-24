@@ -108,8 +108,9 @@ defmodule MongoRustDecoderTest do
       end
     end
 
+    # Run the tests with ELIXIR_ERL_OPTIONS="+sss 20 +sssdcpu 20" to check the smallest stacks.
     test "deeply nested documents fall back instead of overflowing the stack" do
-      for depth <- [127, 300, 1_000] do
+      for depth <- [100, 127, 300, 1_000, 10_000] do
         nested = Enum.reduce(1..depth, %{"leaf" => 1}, fn _, acc -> %{"d" => acc} end)
         assert_same(encode(nested))
 
@@ -137,6 +138,37 @@ defmodule MongoRustDecoderTest do
     binary = encode(%{"a" => 1, "s" => "x", "l" => [%{"d" => ~U[2024-01-01 00:00:00.000Z]}], "id" => BSON.ObjectId.new(1, 2, 3, 4)})
     assert {%{"a" => 1}, ""} = MongoRustDecoder.Native.document(binary)
     assert :fallback == MongoRustDecoder.Native.document(encode(%{"d" => Decimal.new(1)}))
+  end
+
+  test "documents as deep as MongoDB stores them (100 levels) are decoded natively" do
+    nested = Enum.reduce(1..100, %{"leaf" => 1}, fn i, acc -> if rem(i, 2) == 0, do: %{"d" => acc}, else: %{"l" => [acc]} end)
+    binary = encode(nested)
+
+    assert {decoded, ""} = MongoRustDecoder.Native.document(binary)
+    assert decoded == BSON.Decoder.decode(binary)
+  end
+
+  test "builds structs with the same fields as the struct definitions" do
+    binary =
+      encode(%{
+        "date" => ~U[2024-01-01 00:00:00.000Z],
+        "id" => BSON.ObjectId.new(1, 2, 3, 4),
+        "bin" => %BSON.Binary{binary: "x"},
+        "re" => %BSON.Regex{pattern: "a"},
+        "js" => %BSON.JavaScript{code: "x"},
+        "ts" => %BSON.Timestamp{value: 1, ordinal: 2}
+      })
+
+    {decoded, ""} = MongoRustDecoder.Native.document(binary)
+
+    for value <- Map.values(decoded) do
+      assert Enum.sort(Map.keys(value)) == Enum.sort(Map.keys(struct(value.__struct__)))
+    end
+  end
+
+  test "raises FunctionClauseError on input that is not a binary, like BSON.Decoder" do
+    assert_raise FunctionClauseError, fn -> BSON.Decoder.document(123) end
+    assert_raise FunctionClauseError, fn -> MongoRustDecoder.document(123) end
   end
 
   test "document/1 and documents/1 return the rest like BSON.Decoder" do
@@ -168,9 +200,36 @@ defmodule MongoRustDecoderTest do
     end)
   end
 
+  defp doc_gen, do: map_of(string(:printable, max_length: 10), value_gen(), max_length: 8)
+
+  @tag timeout: 300_000
   property "decodes random documents exactly like BSON.Decoder" do
-    check all(doc <- map_of(string(:printable, max_length: 10), value_gen(), max_length: 8), max_runs: 1_000) do
+    check all(doc <- doc_gen(), max_runs: 1_000) do
       assert_same(encode(doc))
+    end
+  end
+
+  # The array body of a cursor batch, as BSON.LazyDocuments holds it.
+  defp batch(docs) do
+    <<_size::little-32, 0x04, "b", 0, array_size::little-32, rest::binary>> = encode(%{"b" => docs})
+    binary_part(rest, 0, array_size - 5)
+  end
+
+  @tag timeout: 300_000
+  property "take_lazy_documents/2 decodes a batch in chunks exactly like BSON.Decoder" do
+    big = constant(%{"big" => String.duplicate("x", 40_000)})
+    decimal = constant(%{"d" => Decimal.new("1.5")})
+
+    check all(docs <- list_of(one_of([doc_gen(), big, decimal]), max_length: 30), count <- integer(1..10), max_runs: 300) do
+      chunks =
+        Stream.unfold(batch(docs), fn
+          "" -> nil
+          binary -> MongoRustDecoder.take_lazy_documents(binary, count)
+        end)
+
+      chunks = Enum.to_list(chunks)
+      assert Enum.all?(chunks, &(length(&1) in 1..count))
+      assert Enum.concat(chunks) == Enum.map(docs, &BSON.Decoder.decode(encode(&1)))
     end
   end
 end

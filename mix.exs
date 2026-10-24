@@ -7,17 +7,19 @@ defmodule MongoRustDecoder.MixProject do
       version: "0.1.0",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
-      elixirc_paths: elixirc_paths(Mix.env()),
-      deps: deps()
+      deps: deps(),
+      description: "A Rust (NIF) BSON decoder for mongodb_driver, built on MongoDB's bson crate",
+      package: [
+        licenses: ["Apache-2.0"],
+        links: %{"GitHub" => "https://github.com/commoncurriculum/elixir-bson"},
+        files: ~w(lib native/mongodb_rust_decoder/src native/mongodb_rust_decoder/Cargo.toml native/mongodb_rust_decoder/Cargo.lock mix.exs README.md LICENSE)
+      ]
     ]
   end
 
   def application do
     [extra_applications: [:logger]]
   end
-
-  defp elixirc_paths(:test), do: ["lib", "test/support"]
-  defp elixirc_paths(_env), do: ["lib"]
 
   defp deps do
     [
