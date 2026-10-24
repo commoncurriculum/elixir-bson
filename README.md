@@ -51,7 +51,7 @@ Key order is not preserved. Use `BSON.PreserveOrderDecoder` if you need that.
   allocates each key binary only once per chunk, for the first 64 distinct keys.
 - As with `BSON.Decoder`, strings and binaries of up to 64 bytes are copied, and longer ones
   are sub-binaries of the reply. Keys are copied.
-- A document over 32 KB is decoded on a dirty CPU scheduler.
+- A document over 16 KB is decoded on a dirty CPU scheduler.
 
 ## Benchmark
 

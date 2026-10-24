@@ -108,7 +108,6 @@ defmodule MongoRustDecoderTest do
       end
     end
 
-    # Run the tests with ELIXIR_ERL_OPTIONS="+sss 20 +sssdcpu 20" to check the smallest stacks.
     test "deeply nested documents fall back instead of overflowing the stack" do
       for depth <- [100, 127, 300, 1_000, 10_000] do
         nested = Enum.reduce(1..depth, %{"leaf" => 1}, fn _, acc -> %{"d" => acc} end)
@@ -140,6 +139,23 @@ defmodule MongoRustDecoderTest do
     assert :fallback == MongoRustDecoder.Native.document(encode(%{"d" => Decimal.new(1)}))
   end
 
+  test "deeply nested documents decode on the smallest scheduler stacks" do
+    # A node whose normal and dirty scheduler stacks are as small as the VM allows.
+    args = ~w(+sss 20 +sssdcpu 20)c ++ Enum.flat_map(:code.get_path(), &[~c"-pa", &1])
+    {:ok, peer, _node} = :peer.start_link(%{connection: :standard_io, args: args})
+
+    try do
+      for depth <- [100, 160, 1_000, 10_000], padding <- [1, 40_000] do
+        nested = Enum.reduce(1..depth, %{"leaf" => String.duplicate("x", padding)}, fn i, acc -> if rem(i, 3) == 0, do: %{"l" => [acc]}, else: %{"d" => acc} end)
+        binary = encode(nested)
+        assert :peer.call(peer, MongoRustDecoder, :decode, [binary], 60_000) == BSON.Decoder.decode(binary)
+      end
+    after
+      :peer.stop(peer)
+    end
+  end
+
+  # Holds for release builds of the NIF (the default); debug builds use more stack per level.
   test "documents as deep as MongoDB stores them (100 levels) are decoded natively" do
     nested = Enum.reduce(1..100, %{"leaf" => 1}, fn i, acc -> if rem(i, 2) == 0, do: %{"d" => acc}, else: %{"l" => [acc]} end)
     binary = encode(nested)
@@ -205,7 +221,10 @@ defmodule MongoRustDecoderTest do
   @tag timeout: 300_000
   property "decodes random documents exactly like BSON.Decoder" do
     check all(doc <- doc_gen(), max_runs: 1_000) do
-      assert_same(encode(doc))
+      binary = encode(doc)
+      assert_same(binary)
+      # The generated values never need BSON.Decoder, so this checks the native path.
+      refute MongoRustDecoder.Native.document(binary) == :fallback
     end
   end
 

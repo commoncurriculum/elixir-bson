@@ -25,12 +25,10 @@ defmodule MongoRustDecoder do
   # Only drivers with lazy cursor batches define this, and only those call the hooks below.
   @compile {:no_warn_undefined, [{BSON.Decoder, :lazy_cursor_document, 2}]}
 
-  # Above this size a document is decoded on a dirty scheduler, so a large reply does not
-  # block a normal scheduler for too long (dense documents decode at about 40 KB/ms).
-  @dirty_threshold 32 * 1024
-
-  # A chunk of a batch decoded in one call stops after about this much input.
-  @chunk_bytes 16 * 1024
+  # A NIF call on a normal scheduler decodes at most this much input, so that it stays under
+  # a millisecond (documents decode at 16 to 40 KB/ms). A larger document is decoded on a
+  # dirty scheduler, and a chunk of a batch stops before going over it.
+  @max_bytes 16 * 1024
 
   @spec decode(binary) :: BSON.document()
   def decode(binary) do
@@ -50,7 +48,7 @@ defmodule MongoRustDecoder do
 
   @spec document(binary) :: {BSON.document(), binary}
   # Decides on the document's own size: the binary may be the rest of a large batch.
-  def document(<<size::little-signed-32, _::binary>> = binary) when size > @dirty_threshold, do: native_result(Native.document_dirty(binary), binary)
+  def document(<<size::little-signed-32, _::binary>> = binary) when size > @max_bytes, do: native_result(Native.document_dirty(binary), binary)
   def document(binary) when is_binary(binary), do: native_result(Native.document(binary), binary)
 
   defp native_result(:fallback, binary), do: BSON.Decoder.document(binary)
@@ -65,7 +63,7 @@ defmodule MongoRustDecoder do
   # stops early at a document that needs BSON.Decoder or a dirty scheduler; if that is the
   # first one, it is decoded on its own, and the next call carries on.
   def take_lazy_documents(binary, count) do
-    case Native.take(binary, count, @chunk_bytes) do
+    case Native.take(binary, count, @max_bytes) do
       {[], _binary} -> take_one(binary)
       result -> result
     end
@@ -73,7 +71,12 @@ defmodule MongoRustDecoder do
 
   defp take_one(<<0x03, rest::binary>>) do
     [_index, rest] = :binary.split(rest, <<0x00>>)
-    {doc, rest} = document(rest)
+    {doc, rest} = take_one_document(rest)
     {[doc], rest}
   end
+
+  # The NIF did not decode it: it is either too large for a normal scheduler or needs
+  # BSON.Decoder.
+  defp take_one_document(<<size::little-signed-32, _::binary>> = binary) when size > @max_bytes, do: native_result(Native.document_dirty(binary), binary)
+  defp take_one_document(binary), do: BSON.Decoder.document(binary)
 end

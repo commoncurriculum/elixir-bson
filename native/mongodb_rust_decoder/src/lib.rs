@@ -22,9 +22,9 @@ use std::mem::MaybeUninit;
 /// Deeper documents are left to `BSON.Decoder`.
 const STACK_BUDGET: usize = 64 * 1024;
 
-/// Input decoded per 1% of a scheduler timeslice (1 ms): dense documents decode at about
-/// 40 KB/ms.
-const BYTES_PER_PERCENT: usize = 400;
+/// Input charged as 1% of a scheduler timeslice (1 ms). Typical documents decode at about
+/// 40 KB/ms, documents with many distinct keys at about 16 KB/ms; this assumes 25 KB/ms.
+const BYTES_PER_PERCENT: usize = 250;
 
 /// Array index keys ("0", "1", ...) are at most this long.
 const MAX_INDEX_KEY: usize = 20;
@@ -141,8 +141,10 @@ impl<'a> Ctx<'a> {
         let offset = (bytes.as_ptr() as usize)
             .checked_sub(self.source.as_slice().as_ptr() as usize)
             .expect("decoded slices lie within the source binary");
-        // SAFETY: every slice decoded here lies within the source binary.
-        unsafe { self.source.make_subbinary_unchecked(offset, bytes.len()) }.encode(self.env)
+        self.source
+            .make_subbinary(offset, bytes.len())
+            .expect("decoded slices lie within the source binary")
+            .encode(self.env)
     }
 
     fn document(&mut self, doc: &'a RawDocument) -> Decoded<'a> {
@@ -319,6 +321,7 @@ fn copied_binary<'a>(env: Env<'a>, bytes: &[u8]) -> Term<'a> {
 
 /// enif_make_map_from_arrays without the extra copies of rustler's wrapper. `None` on duplicate keys.
 fn make_map<'a>(env: Env<'a>, keys: &[ErlNifTerm], values: &[ErlNifTerm]) -> Option<Term<'a>> {
+    assert_eq!(keys.len(), values.len(), "a map has as many keys as values");
     let mut map = MaybeUninit::uninit();
     // SAFETY: both slices hold valid terms of this env and have the same length.
     let ok = unsafe {
@@ -421,23 +424,24 @@ fn element_document(bytes: &[u8]) -> Option<(usize, &RawDocument)> {
     framed(&bytes[start..]).map(|doc| (start, doc))
 }
 
-/// `dirty`: on a dirty scheduler, which has no timeslice to charge.
-fn decode_one<'a>(env: Env<'a>, binary: Binary<'a>, dirty: bool) -> Term<'a> {
+/// The rest of `binary` after its first `pos` bytes.
+fn rest<'a>(binary: &Binary<'a>, pos: usize) -> Binary<'a> {
+    binary
+        .make_subbinary(pos, binary.len() - pos)
+        .expect("pos lies within the binary")
+}
+
+fn decode_one<'a>(env: Env<'a>, binary: Binary<'a>) -> Term<'a> {
     let bytes: &'a [u8] = binary.as_slice();
     let mut ctx = Ctx::new(env, binary);
     let Some(doc) = framed(bytes) else {
         return atoms::fallback().encode(env);
     };
     let size = doc.as_bytes().len();
-    if !dirty {
-        consume_timeslice(env, size);
-    }
+    // A no-op on a dirty scheduler.
+    consume_timeslice(env, size);
     match ctx.document(doc) {
-        // SAFETY: size <= bytes.len().
-        Some(term) => (term, unsafe {
-            binary.make_subbinary_unchecked(size, bytes.len() - size)
-        })
-            .encode(env),
+        Some(term) => (term, rest(&binary, size)).encode(env),
         None => atoms::fallback().encode(env),
     }
 }
@@ -446,19 +450,20 @@ fn decode_one<'a>(env: Env<'a>, binary: Binary<'a>, dirty: bool) -> Term<'a> {
 /// (also for input that is not BSON, so that `BSON.Decoder` raises its usual error).
 #[rustler::nif]
 fn document<'a>(env: Env<'a>, binary: Binary<'a>) -> Term<'a> {
-    decode_one(env, binary, false)
+    decode_one(env, binary)
 }
 
 /// Same as `document/1`, on a dirty CPU scheduler, for large inputs.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn document_dirty<'a>(env: Env<'a>, binary: Binary<'a>) -> Term<'a> {
-    decode_one(env, binary, true)
+    decode_one(env, binary)
 }
 
 /// Decodes up to `count` documents from the body of a BSON array (the raw batch held by
 /// `BSON.LazyDocuments`), within `max_bytes` of input so a call stays short. Returns
 /// `{docs, rest}`; it stops early, before the element at the start of `rest`, at an element
-/// it cannot decode natively or that does not fit the budget, which the caller decodes on its own.
+/// it cannot decode natively or that does not fit the budget. When it returns no documents,
+/// the first one is either larger than `max_bytes` or needs `BSON.Decoder`.
 #[rustler::nif]
 fn take<'a>(env: Env<'a>, binary: Binary<'a>, count: usize, max_bytes: usize) -> Term<'a> {
     let bytes: &'a [u8] = binary.as_slice();
@@ -469,8 +474,9 @@ fn take<'a>(env: Env<'a>, binary: Binary<'a>, count: usize, max_bytes: usize) ->
         let Some((start, doc)) = element_document(&bytes[pos..]) else {
             break;
         };
-        let end = pos + start + doc.as_bytes().len();
-        if end > max_bytes {
+        let size = doc.as_bytes().len();
+        let end = pos + start + size;
+        if size > max_bytes || (pos > 0 && end > max_bytes) {
             break;
         }
         let Some(term) = ctx.document(doc) else {
@@ -480,10 +486,8 @@ fn take<'a>(env: Env<'a>, binary: Binary<'a>, count: usize, max_bytes: usize) ->
         pos = end;
     }
     consume_timeslice(env, pos);
-    // SAFETY: pos <= bytes.len().
-    let rest = unsafe { binary.make_subbinary_unchecked(pos, bytes.len() - pos) };
     let docs = make_list(env, &docs).expect("count is a small chunk size");
-    (docs, rest).encode(env)
+    (docs, rest(&binary, pos)).encode(env)
 }
 
 rustler::init!("Elixir.MongoRustDecoder.Native");
